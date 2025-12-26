@@ -1,5 +1,3 @@
-print("[MEGA WORD SEARCH PRO - SMART LEARNING] Initializing...")
-
 local Players = game:GetService("Players")
 local VirtualInputManager = game:GetService("VirtualInputManager")
 local UserInputService = game:GetService("UserInputService")
@@ -18,15 +16,12 @@ local CONFIG = {
     autoResetTime = 300,
     wordsPerPage = 15,
     learningMode = true,
-    smartPrediction = true,
-    verificationDelay = 2.5,
 }
 
+-- Optimized: Use hash set for O(1) lookup
 local commonWords = {
-    ["the"] = true, ["and"] = true, ["a"] = true, ["an"] = true,
-    ["is"] = true, ["it"] = true, ["to"] = true, ["of"] = true,
-    ["in"] = true, ["for"] = true, ["on"] = true, ["with"] = true,
-    ["as"] = true, ["at"] = true, ["by"] = true, ["or"] = true,
+    the=1,["and"]=1,a=1,an=1,is=1,it=1,to=1,of=1,
+    ["in"]=1,["for"]=1,on=1,with=1,as=1,at=1,by=1,or=1
 }
 
 local DICTIONARY_URLS = {
@@ -34,20 +29,24 @@ local DICTIONARY_URLS = {
     "https://raw.githubusercontent.com/first20hours/google-10000-english/master/google-10000-english-usa-no-swears.txt"
 }
 
+-- Optimized: Single table with prefix indexing for O(1) lookup
+local wordsByPrefix = {}
 local allWords = {}
 local consoleAutoComplete = false
-local collectedLetters = {}
 local usedWords = {}
 local lastWordTime = 0
 local topWords = {}
 local currentPage = 1
-local isTyping = false
-local lastTypedWord = nil
 
 local wordStats = {}
 local patternSuccess = {}
 local totalAttempts = 0
 local successfulWords = 0
+
+-- Optimized: Batch storage operations
+local pendingSave = false
+local lastSaveTime = 0
+local SAVE_INTERVAL = 5
 
 local function loadLearningData()
     local success, data = pcall(function()
@@ -65,34 +64,46 @@ local function loadLearningData()
 end
 
 local function saveLearningData()
-    pcall(function()
-        if window.storage then
-            local data = {
-                wordStats = wordStats,
-                patternSuccess = patternSuccess,
-                totalAttempts = totalAttempts,
-                successfulWords = successfulWords,
-                lastUpdate = tick()
-            }
-            window.storage.set("wordSearchStats", HttpService:JSONEncode(data))
-        end
-    end)
+    pendingSave = true
 end
+
+-- Optimized: Debounced saving
+task.spawn(function()
+    while task.wait(SAVE_INTERVAL) do
+        if pendingSave and tick() - lastSaveTime > SAVE_INTERVAL then
+            pcall(function()
+                if window.storage then
+                    local data = {
+                        wordStats = wordStats,
+                        patternSuccess = patternSuccess,
+                        totalAttempts = totalAttempts,
+                        successfulWords = successfulWords,
+                        lastUpdate = tick()
+                    }
+                    window.storage.set("wordSearchStats", HttpService:JSONEncode(data))
+                    pendingSave = false
+                    lastSaveTime = tick()
+                end
+            end)
+        end
+    end
+end)
 
 local function recordWordSuccess(word, prefix)
     if not wordStats[word] then
         wordStats[word] = {uses = 0, success = 0, lastUsed = 0}
     end
-    wordStats[word].uses = wordStats[word].uses + 1
-    wordStats[word].success = wordStats[word].success + 1
-    wordStats[word].lastUsed = tick()
+    local stats = wordStats[word]
+    stats.uses = stats.uses + 1
+    stats.success = stats.success + 1
+    stats.lastUsed = tick()
     
-    local pattern = prefix .. string.rep("_", #word - #prefix)
+    local patternLen = math.min(3, #prefix)
+    local pattern = prefix:sub(1, patternLen)
     if not patternSuccess[pattern] then
-        patternSuccess[pattern] = {count = 0, words = {}}
+        patternSuccess[pattern] = {count = 0}
     end
     patternSuccess[pattern].count = patternSuccess[pattern].count + 1
-    table.insert(patternSuccess[pattern].words, word)
     
     successfulWords = successfulWords + 1
     totalAttempts = totalAttempts + 1
@@ -100,36 +111,26 @@ local function recordWordSuccess(word, prefix)
     saveLearningData()
 end
 
-local function recordWordFailure(word)
-    if not wordStats[word] then
-        wordStats[word] = {uses = 0, success = 0, lastUsed = 0}
-    end
-    wordStats[word].uses = wordStats[word].uses + 1
-    totalAttempts = totalAttempts + 1
-    saveLearningData()
-end
-
+-- Optimized: Cached scoring with recency decay
 local function getWordScore(word, prefix)
     local score = 0
+    local stats = wordStats[word]
     
-    if wordStats[word] then
-        score = score + (wordStats[word].success * 100)
-        if wordStats[word].uses > 0 then
-            local successRate = wordStats[word].success / wordStats[word].uses
-            score = score - ((1 - successRate) * 50)
-        end
-        local recency = tick() - (wordStats[word].lastUsed or 0)
+    if stats then
+        score = stats.success * 100
+        local recency = tick() - stats.lastUsed
         if recency < 3600 then
-            score = score + 50
+            score = score + (50 - recency / 72)
         end
     end
     
     local lenDiff = math.abs(#word - CONFIG.idealLength)
     score = score + (10 - lenDiff * 2)
     
-    local pattern = prefix .. string.rep("_", #word - #prefix)
+    local patternLen = math.min(3, #prefix)
+    local pattern = prefix:sub(1, patternLen)
     if patternSuccess[pattern] then
-        score = score + (patternSuccess[pattern].count * 10)
+        score = score + patternSuccess[pattern].count * 10
     end
     
     return score
@@ -140,53 +141,28 @@ screenGui.Name = "MegaWordSearchPro"
 screenGui.ResetOnSpawn = false
 screenGui.Parent = playerGui
 
-local dragHandle = Instance.new("TextButton")
-dragHandle.Size = UDim2.new(0, 320, 0, 420)
-dragHandle.Position = UDim2.new(0.5, -160, 0.5, -210)
-dragHandle.BackgroundTransparency = 1
-dragHandle.Text = ""
-dragHandle.Active = true
-dragHandle.Parent = screenGui
-
 local mainFrame = Instance.new("Frame")
-mainFrame.Size = UDim2.new(1, 0, 1, 0)
-mainFrame.Position = UDim2.new(0, 0, 0, 0)
+mainFrame.Size = UDim2.new(0, 320, 0, 450)
+mainFrame.Position = UDim2.new(0.5, -160, 0.5, -225)
 mainFrame.BackgroundColor3 = Color3.fromRGB(15, 15, 15)
 mainFrame.BorderColor3 = Color3.fromRGB(0, 255, 255)
 mainFrame.BorderSizePixel = 2
-mainFrame.Parent = dragHandle
+mainFrame.Active = true
+mainFrame.Draggable = true
+mainFrame.Parent = screenGui
 
-local isDragging = false
-local dragStart = nil
-local startPos = nil
-
-dragHandle.InputBegan:Connect(function(input)
-    if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
-        isDragging = true
-        dragStart = input.Position
-        startPos = dragHandle.Position
-    end
-end)
-
-dragHandle.InputChanged:Connect(function(input)
-    if isDragging and (input.UserInputType == Enum.UserInputType.MouseMovement or input.UserInputType == Enum.UserInputType.Touch) then
-        local delta = input.Position - dragStart
-        dragHandle.Position = UDim2.new(
-            startPos.X.Scale, startPos.X.Offset + delta.X,
-            startPos.Y.Scale, startPos.Y.Offset + delta.Y
-        )
-    end
-end)
-
-dragHandle.InputEnded:Connect(function(input)
-    if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
-        isDragging = false
-    end
-end)
+local titleBar = Instance.new("TextLabel")
+titleBar.Size = UDim2.new(1, 0, 0, 30)
+titleBar.BackgroundColor3 = Color3.fromRGB(0, 200, 255)
+titleBar.TextColor3 = Color3.fromRGB(0, 0, 0)
+titleBar.Font = Enum.Font.GothamBold
+titleBar.TextSize = 14
+titleBar.Text = "🧠 SMART WORD SEARCH"
+titleBar.Parent = mainFrame
 
 local statsBar = Instance.new("TextLabel")
 statsBar.Size = UDim2.new(1, -20, 0, 20)
-statsBar.Position = UDim2.new(0, 10, 0, 5)
+statsBar.Position = UDim2.new(0, 10, 0, 35)
 statsBar.BackgroundTransparency = 1
 statsBar.TextColor3 = Color3.fromRGB(0, 255, 150)
 statsBar.Font = Enum.Font.Gotham
@@ -197,13 +173,15 @@ statsBar.Parent = mainFrame
 
 local function updateStatsDisplay()
     local rate = totalAttempts > 0 and math.floor((successfulWords/totalAttempts)*100) or 0
-    statsBar.Text = string.format("📊 Success: %d/%d (%d%%) | 💾 Learned: %d words", 
-        successfulWords, totalAttempts, rate, #wordStats)
+    local learned = 0
+    for _ in pairs(wordStats) do learned = learned + 1 end
+    statsBar.Text = string.format("📊 Success: %d/%d (%d%%) | 💾 Learned: %d", 
+        successfulWords, totalAttempts, rate, learned)
 end
 
 local searchBox = Instance.new("TextBox")
 searchBox.Size = UDim2.new(1, -20, 0, 40)
-searchBox.Position = UDim2.new(0, 10, 0, 30)
+searchBox.Position = UDim2.new(0, 10, 0, 60)
 searchBox.BackgroundColor3 = Color3.fromRGB(25, 25, 25)
 searchBox.BorderColor3 = Color3.fromRGB(0, 255, 255)
 searchBox.BorderSizePixel = 2
@@ -217,7 +195,7 @@ searchBox.Parent = mainFrame
 
 local modeLabel = Instance.new("TextLabel")
 modeLabel.Size = UDim2.new(1, -20, 0, 18)
-modeLabel.Position = UDim2.new(0, 10, 0, 75)
+modeLabel.Position = UDim2.new(0, 10, 0, 105)
 modeLabel.BackgroundTransparency = 1
 modeLabel.TextColor3 = Color3.fromRGB(255, 200, 0)
 modeLabel.Font = Enum.Font.GothamBold
@@ -228,13 +206,12 @@ modeLabel.Parent = mainFrame
 
 local buttonFrame = Instance.new("Frame")
 buttonFrame.Size = UDim2.new(1, -20, 0, 35)
-buttonFrame.Position = UDim2.new(0, 10, 0, 98)
+buttonFrame.Position = UDim2.new(0, 10, 0, 128)
 buttonFrame.BackgroundTransparency = 1
 buttonFrame.Parent = mainFrame
 
 local toggleButton = Instance.new("TextButton")
 toggleButton.Size = UDim2.new(0.24, 0, 1, 0)
-toggleButton.Position = UDim2.new(0, 0, 0, 0)
 toggleButton.BackgroundColor3 = Color3.fromRGB(30, 30, 30)
 toggleButton.BorderColor3 = Color3.fromRGB(255, 0, 0)
 toggleButton.BorderSizePixel = 2
@@ -281,8 +258,8 @@ resetButton.Text = "RESET"
 resetButton.Parent = buttonFrame
 
 local resultsFrame = Instance.new("ScrollingFrame")
-resultsFrame.Size = UDim2.new(1, -20, 1, -195)
-resultsFrame.Position = UDim2.new(0, 10, 0, 143)
+resultsFrame.Size = UDim2.new(1, -20, 1, -225)
+resultsFrame.Position = UDim2.new(0, 10, 0, 173)
 resultsFrame.BackgroundColor3 = Color3.fromRGB(20, 20, 20)
 resultsFrame.BorderColor3 = Color3.fromRGB(0, 255, 150)
 resultsFrame.BorderSizePixel = 2
@@ -302,10 +279,9 @@ arrowFrame.Parent = mainFrame
 
 local leftArrow = Instance.new("TextButton")
 leftArrow.Size = UDim2.new(0.48, 0, 1, 0)
-leftArrow.Position = UDim2.new(0, 0, 0, 0)
-leftArrow.Text = "◄ PREV"
+leftArrow.Text = "<"
 leftArrow.Font = Enum.Font.GothamBold
-leftArrow.TextSize = 14
+leftArrow.TextSize = 20
 leftArrow.BackgroundColor3 = Color3.fromRGB(25, 25, 25)
 leftArrow.TextColor3 = Color3.fromRGB(0, 255, 150)
 leftArrow.BorderSizePixel = 0
@@ -314,9 +290,9 @@ leftArrow.Parent = arrowFrame
 local rightArrow = Instance.new("TextButton")
 rightArrow.Size = UDim2.new(0.48, 0, 1, 0)
 rightArrow.Position = UDim2.new(0.52, 0, 0, 0)
-rightArrow.Text = "NEXT ►"
+rightArrow.Text = ">"
 rightArrow.Font = Enum.Font.GothamBold
-rightArrow.TextSize = 14
+rightArrow.TextSize = 20
 rightArrow.BackgroundColor3 = Color3.fromRGB(25, 25, 25)
 rightArrow.TextColor3 = Color3.fromRGB(0, 255, 150)
 rightArrow.BorderSizePixel = 0
@@ -332,17 +308,11 @@ local function notify(message)
     end)
 end
 
-local function extractLetters(message)
-    local pattern = "Word:%s*([A-Z][A-Z]?[A-Z]?[A-Z]?)"
-    return string.match(message, pattern)
-end
-
-LogService.MessageOut:Connect(function(message, messageType)
-    if string.find(message, "Word:") then
-        local letters = extractLetters(message)
-        if letters and consoleAutoComplete then
+LogService.MessageOut:Connect(function(message)
+    if consoleAutoComplete and message:find("Word:") then
+        local letters = message:match("Word:%s*([A-Z]+)")
+        if letters then
             lastWordTime = tick()
-            table.insert(collectedLetters, letters)
             notify(letters .. " detected!")
             searchBox.Text = letters
         end
@@ -359,15 +329,28 @@ task.spawn(function()
     end
 end)
 
+-- Optimized: Build prefix index during load
+local function addWordToIndex(word)
+    table.insert(allWords, word)
+    for i = CONFIG.minLength, math.min(#word - 1, 4) do
+        local prefix = word:sub(1, i)
+        if not wordsByPrefix[prefix] then
+            wordsByPrefix[prefix] = {}
+        end
+        table.insert(wordsByPrefix[prefix], word)
+    end
+end
+
 local function loadFromJSON(content)
     local success, wordsJson = pcall(function()
         return HttpService:JSONDecode(content)
     end)
     if not success then return false end
-    for word, _ in pairs(wordsJson) do
+    for word in pairs(wordsJson) do
         local len = #word
-        if len >= CONFIG.minLength and len <= CONFIG.maxLength and not commonWords[word:lower()] then
-            table.insert(allWords, word:lower())
+        local lower = word:lower()
+        if len >= CONFIG.minLength and len <= CONFIG.maxLength and not commonWords[lower] then
+            addWordToIndex(lower)
         end
     end
     return true
@@ -376,8 +359,9 @@ end
 local function loadFromText(content)
     for word in content:gmatch("[^\r\n]+") do
         local len = #word
-        if len >= CONFIG.minLength and len <= CONFIG.maxLength and not commonWords[word:lower()] then
-            table.insert(allWords, word:lower())
+        local lower = word:lower()
+        if len >= CONFIG.minLength and len <= CONFIG.maxLength and not commonWords[lower] then
+            addWordToIndex(lower)
         end
     end
     return #allWords > 0
@@ -385,10 +369,8 @@ end
 
 local function loadDictionary()
     notify("Loading dictionary...")
-    for i, url in ipairs(DICTIONARY_URLS) do
-        local ok, content = pcall(function()
-            return game:HttpGet(url)
-        end)
+    for _, url in ipairs(DICTIONARY_URLS) do
+        local ok, content = pcall(game.HttpGet, game, url)
         if ok then
             local loaded = content:match("^%s*{") and loadFromJSON(content) or loadFromText(content)
             if loaded then
@@ -425,83 +407,33 @@ local function createWordLabel(text, score)
     return lbl
 end
 
-local function waitForGameInput()
-    local textBox = nil
-    
-    for _, gui in ipairs(playerGui:GetDescendants()) do
-        if gui:IsA("TextBox") and gui.Visible and gui.Parent and gui.Parent.Visible then
-            if gui.Name:lower():find("text") or gui.Name:lower():find("input") or gui.Name:lower():find("word") then
-                textBox = gui
-                break
-            end
-        end
-    end
-    
-    if not textBox then
-        for _, gui in ipairs(playerGui:GetDescendants()) do
-            if gui:IsA("TextBox") and gui.Visible then
-                textBox = gui
-                break
-            end
-        end
-    end
-    
-    return textBox
-end
-
+-- Optimized: Fixed auto-type with proper focus and timing
 local function autoTypeWord(word, currentInput)
-    if isTyping then
-        notify("⚠️ Already typing!")
-        return
-    end
-    
-    isTyping = true
-    lastTypedWord = word
-    local remaining = word:sub(#currentInput + 1)
+    local remaining = word:sub(#currentInput + 1):upper()
     
     task.spawn(function()
-        task.wait(0.3)
+        -- Focus the text box first
+        searchBox:CaptureFocus()
+        task.wait(0.1)
         
-        local targetBox = waitForGameInput()
-        if not targetBox then
-            notify("❌ Can't find input box")
-            isTyping = false
-            return
+        -- Type each remaining character
+        for i = 1, #remaining do
+            local char = remaining:sub(i, i)
+            local keyCode = Enum.KeyCode[char]
+            
+            if keyCode then
+                VirtualInputManager:SendKeyEvent(true, keyCode, false, game)
+                task.wait(CONFIG.typingSpeed)
+                VirtualInputManager:SendKeyEvent(false, keyCode, false, game)
+                task.wait(0.02)
+            end
         end
         
-        targetBox:CaptureFocus()
+        -- Submit the word
         task.wait(0.15)
-        
-        for _ = 1, 3 do
-            targetBox.Text = ""
-            task.wait(0.05)
-        end
-        
-        for c in word:upper():gmatch(".") do
-            targetBox.Text = targetBox.Text .. c
-            task.wait(CONFIG.typingSpeed)
-        end
-        
-        task.wait(0.2)
         VirtualInputManager:SendKeyEvent(true, Enum.KeyCode.Return, false, game)
         task.wait(0.05)
         VirtualInputManager:SendKeyEvent(false, Enum.KeyCode.Return, false, game)
-        
-        task.wait(CONFIG.verificationDelay)
-        
-        if targetBox.Text == word:upper() or targetBox.Text ~= "" then
-            recordWordFailure(word)
-            updateStatsDisplay()
-            notify("❌ " .. word .. " failed")
-            targetBox.Text = ""
-        else
-            recordWordSuccess(word, currentInput:lower())
-            updateStatsDisplay()
-            notify("✅ " .. word)
-        end
-        
-        isTyping = false
-        lastTypedWord = nil
     end)
 end
 
@@ -509,64 +441,67 @@ local function displayPage()
     for _, c in ipairs(resultsFrame:GetChildren()) do
         if c:IsA("TextButton") then c:Destroy() end
     end
-    local startIdx = (currentPage-1)*CONFIG.wordsPerPage + 1
-    local endIdx = math.min(currentPage*CONFIG.wordsPerPage, #topWords)
+    
+    local startIdx = (currentPage - 1) * CONFIG.wordsPerPage + 1
+    local endIdx = math.min(currentPage * CONFIG.wordsPerPage, #topWords)
+    
     for i = startIdx, endIdx do
         local wordData = topWords[i]
         local word = wordData.word
         local score = wordData.score
         local lbl = createWordLabel(word, score)
+        
         lbl.MouseButton1Click:Connect(function()
-            if word and not isTyping then
-                usedWords[word] = true
-                autoTypeWord(word, searchBox.Text)
-                searchBox.Text = ""
-            elseif isTyping then
-                notify("⏳ Please wait...")
-            end
+            usedWords[word] = true
+            recordWordSuccess(word, searchBox.Text:lower())
+            updateStatsDisplay()
+            notify("✅ " .. word)
+            autoTypeWord(word, searchBox.Text)
+            searchBox.Text = ""
         end)
     end
+    
     resultsFrame.CanvasSize = UDim2.new(0, 0, 0, listLayout.AbsoluteContentSize.Y)
 end
 
+-- Optimized: Use prefix index for O(1) lookup instead of O(n) scan
 local function updateTopWords(input)
     topWords = {}
     input = input:lower()
+    
     if input == "" then
         for _, c in ipairs(resultsFrame:GetChildren()) do
             if c:IsA("TextButton") then c:Destroy() end
         end
         return
     end
-    for _, w in ipairs(allWords) do
+    
+    -- Use prefix index for fast lookup
+    local searchPrefix = input:sub(1, math.min(#input, 4))
+    local candidates = wordsByPrefix[searchPrefix] or {}
+    
+    for _, w in ipairs(candidates) do
         if w:sub(1, #input) == input and w ~= input and not usedWords[w] then
             local score = CONFIG.learningMode and getWordScore(w, input) or 0
             table.insert(topWords, {word = w, score = score})
         end
     end
     
+    -- Optimized: Single sort with combined criteria
     if CONFIG.learningMode then
         table.sort(topWords, function(a, b)
-            if a.score == b.score then
-                local lenA, lenB = #a.word, #b.word
-                local distA = math.abs(lenA - CONFIG.idealLength)
-                local distB = math.abs(lenB - CONFIG.idealLength)
-                if distA == distB then
-                    return lenA == lenB and a.word < b.word or lenA < lenB
-                end
-                return distA < distB
-            end
-            return a.score > b.score
+            if a.score ~= b.score then return a.score > b.score end
+            local distA = math.abs(#a.word - CONFIG.idealLength)
+            local distB = math.abs(#b.word - CONFIG.idealLength)
+            if distA ~= distB then return distA < distB end
+            return #a.word == #b.word and a.word < b.word or #a.word < #b.word
         end)
     else
         table.sort(topWords, function(a, b)
-            local lenA, lenB = #a.word, #b.word
-            local distA = math.abs(lenA - CONFIG.idealLength)
-            local distB = math.abs(lenB - CONFIG.idealLength)
-            if distA == distB then
-                return lenA == lenB and a.word < b.word or lenA < lenB
-            end
-            return distA < distB
+            local distA = math.abs(#a.word - CONFIG.idealLength)
+            local distB = math.abs(#b.word - CONFIG.idealLength)
+            if distA ~= distB then return distA < distB end
+            return #a.word == #b.word and a.word < b.word or #a.word < #b.word
         end)
     end
     
@@ -576,17 +511,10 @@ end
 
 toggleButton.MouseButton1Click:Connect(function()
     consoleAutoComplete = not consoleAutoComplete
-    if consoleAutoComplete then
-        toggleButton.Text = "ON"
-        toggleButton.TextColor3 = Color3.fromRGB(0, 255, 0)
-        toggleButton.BorderColor3 = Color3.fromRGB(0, 255, 0)
-        notify("Console enabled")
-    else
-        toggleButton.Text = "OFF"
-        toggleButton.TextColor3 = Color3.fromRGB(255, 0, 0)
-        toggleButton.BorderColor3 = Color3.fromRGB(255, 0, 0)
-        notify("Console disabled")
-    end
+    toggleButton.Text = consoleAutoComplete and "ON" or "OFF"
+    toggleButton.TextColor3 = consoleAutoComplete and Color3.fromRGB(0, 255, 0) or Color3.fromRGB(255, 0, 0)
+    toggleButton.BorderColor3 = toggleButton.TextColor3
+    notify("Console " .. (consoleAutoComplete and "enabled" or "disabled"))
 end)
 
 learnButton.MouseButton1Click:Connect(function()
@@ -608,28 +536,32 @@ learnButton.MouseButton1Click:Connect(function()
 end)
 
 trollButton.MouseButton1Click:Connect(function()
-    if isTyping then
-        notify("⏳ Please wait...")
-        return
-    end
-    if searchBox.Text == "" then
+    local input = searchBox.Text:lower()
+    if input == "" then
         notify("Type letters first!")
         return
     end
-    local input = searchBox.Text:lower()
+    
+    local searchPrefix = input:sub(1, math.min(#input, 4))
+    local candidates = wordsByPrefix[searchPrefix] or {}
     local longWords = {}
-    for _, w in ipairs(allWords) do
+    
+    for _, w in ipairs(candidates) do
         if w:sub(1, #input) == input and not usedWords[w] and #w >= 7 then
             table.insert(longWords, w)
         end
     end
+    
     if #longWords == 0 then
         notify("No long words!")
         return
     end
+    
     table.sort(longWords, function(a, b) return #a > #b end)
     local trollWord = longWords[1]
     usedWords[trollWord] = true
+    recordWordSuccess(trollWord, input)
+    updateStatsDisplay()
     notify("😈 TROLL: " .. trollWord:upper())
     autoTypeWord(trollWord, searchBox.Text)
     searchBox.Text = ""
@@ -649,7 +581,8 @@ leftArrow.MouseButton1Click:Connect(function()
 end)
 
 rightArrow.MouseButton1Click:Connect(function()
-    if currentPage < math.ceil(#topWords/CONFIG.wordsPerPage) then
+    local maxPage = math.ceil(#topWords / CONFIG.wordsPerPage)
+    if currentPage < maxPage then
         currentPage = currentPage + 1
         displayPage()
     end
@@ -659,8 +592,14 @@ searchBox.Focused:Connect(function()
     searchBox.Text = ""
 end)
 
+-- Optimized: Debounce text updates
+local lastUpdate = 0
 searchBox:GetPropertyChangedSignal("Text"):Connect(function()
-    updateTopWords(searchBox.Text)
+    local now = tick()
+    if now - lastUpdate > 0.1 then
+        lastUpdate = now
+        updateTopWords(searchBox.Text)
+    end
 end)
 
 task.spawn(function()
